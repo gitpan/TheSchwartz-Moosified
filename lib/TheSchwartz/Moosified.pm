@@ -7,11 +7,11 @@ use Scalar::Util qw( refaddr );
 use List::Util qw( shuffle );
 use File::Spec ();
 use Storable ();
-use TheSchwartz::Moosified::Utils qw/insert_id sql_for_unixtime bind_param_attr/;
+use TheSchwartz::Moosified::Utils qw/insert_id sql_for_unixtime bind_param_attr run_in_txn order_by_priority/;
 use TheSchwartz::Moosified::Job;
 use TheSchwartz::Moosified::JobHandle;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 our $AUTHORITY = 'cpan:FAYLAND';
 
 ## Number of jobs to fetch at a time in find_job_for_workers.
@@ -89,6 +89,39 @@ sub shuffled_databases {
     return shuffle( @{ $self->databases } );
 }
 
+sub _try_insert {
+    my $self = shift;
+    my $job = shift;
+    my $dbh = shift;
+    run_in_txn {
+        $job->funcid( $self->funcname_to_id( $dbh, $job->funcname ) );
+        $job->insert_time(time());
+
+        my $row = $job->as_hashref;
+        if ($dbh->{Driver}{Name} && $dbh->{Driver}{Name} eq 'Pg') {
+            delete $row->{jobid};
+        }
+        my @col = keys %$row;
+
+        my $sql = sprintf 'INSERT INTO job (%s) VALUES (%s)',
+            join( ", ", @col ), join( ", ", ("?") x @col );
+
+        my $sth = $dbh->prepare_cached($sql);
+        my $i = 1;
+        for my $col (@col) {
+            $sth->bind_param(
+                $i++,
+                $row->{$col},
+                bind_param_attr( $dbh, $col ),
+            );
+        }
+        $sth->execute();
+
+        my $jobid = insert_id( $dbh, $sth, "job", "jobid" );
+        $job->jobid($jobid);
+    } $dbh;
+}
+
 sub insert {
     my $self = shift;
 
@@ -103,41 +136,20 @@ sub insert {
 
     for my $dbh ( $self->shuffled_databases ) {
         eval {
-            $job->funcid( $self->funcname_to_id( $dbh, $job->funcname ) );
-            $job->insert_time(time());
-
-            my $row = $job->as_hashref;
-            my @col = keys %$row;
-
-            my $sql = sprintf 'INSERT INTO job (%s) VALUES (%s)',
-                join( ", ", @col ), join( ", ", ("?") x @col );
-
-            my $sth = $dbh->prepare_cached($sql);
-            my $i = 1;
-            for my $col (@col) {
-                $sth->bind_param(
-                    $i++,
-                    $row->{$col},
-                    bind_param_attr( $dbh, $col ),
-                );
-            }
-            $sth->execute();
-
-            my $jobid = insert_id( $dbh, $sth, "job", "jobid" );
-            $job->jobid($jobid);
+            $self->_try_insert($job,$dbh);
         };
 
-        if ($job->jobid) {
-            ## We inserted the job successfully!
-            ## Attach a handle to the job, and return the handle.
-            my $handle = TheSchwartz::Moosified::JobHandle->new({
-                    dbh    => $dbh,
-                    client => $self,
-                    jobid  => $job->jobid
-                });
-            $job->handle($handle);
-            return $handle;
-        }
+        next unless $job->jobid;
+
+        ## We inserted the job successfully!
+        ## Attach a handle to the job, and return the handle.
+        my $handle = TheSchwartz::Moosified::JobHandle->new({
+                dbh    => $dbh,
+                client => $self,
+                jobid  => $job->jobid
+            });
+        $job->handle($handle);
+        return $handle;
     }
 
     return;
@@ -169,7 +181,7 @@ sub find_job_for_workers {
                       @$worker_classes;
 
             my $ids = join(',', @ids);
-            my $sql = qq~SELECT * FROM job WHERE funcid IN ($ids) AND run_after <= $unixtime AND grabbed_until <= $unixtime $order_by LIMIT 0, $limit~;
+            my $sql = qq~SELECT * FROM job WHERE funcid IN ($ids) AND run_after <= $unixtime AND grabbed_until <= $unixtime $order_by LIMIT $limit~;
 
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute();
@@ -266,10 +278,12 @@ sub list_jobs {
     }
     
     my $limit    = $arg->{limit} || $FIND_JOB_BATCH_SIZE;
-    my $order_by = $self->prioritize ? 'ORDER BY priority DESC' : '';
 
     my @jobs;
     for my $dbh ( $self->shuffled_databases ) {
+        #my $order_by = $self->prioritize ? 'ORDER BY priority DESC' : '';
+        my $order_by = $self->prioritize ? order_by_priority($dbh) : '';
+
         eval {
             
             my ($funcid, $funcop);
@@ -281,7 +295,7 @@ sub list_jobs {
                 $funcop = '=';
             }
 
-            my $sql = qq~SELECT * FROM job WHERE funcid $funcop $funcid $order_by LIMIT 0, $limit~;
+            my $sql = qq~SELECT * FROM job WHERE funcid $funcop $funcid $order_by LIMIT $limit~;
             my @value = ();
             for (@options) {
                 $sql .= " AND $_->{key} $_->{op} ?";
@@ -291,6 +305,7 @@ sub list_jobs {
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute(@value);
             while ( my $ref = $sth->fetchrow_hashref ) {
+                $ref->{funcname} = $self->funcid_to_name($dbh, $ref->{funcid});
                 my $job = TheSchwartz::Moosified::Job->new( $ref );
                 if ($arg->{want_handle}) {
                     my $handle = TheSchwartz::Moosified::JobHandle->new({
@@ -339,10 +354,11 @@ sub _find_job_with_coalescing {
             ##    in the past).
             my $funcid = $client->funcname_to_id($dbh, $funcname);
 
-            my $sql = qq~SELECT * FROM job WHERE funcid = ? AND run_after <= $unixtime AND grabbed_until <= $unixtime AND coalesce $op ? $order_by LIMIT 0, $limit~;
+            my $sql = qq~SELECT * FROM job WHERE funcid = ? AND run_after <= $unixtime AND grabbed_until <= $unixtime AND coalesce $op ? $order_by LIMIT $limit~;
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute( $funcid, $coval );
             while ( my $ref = $sth->fetchrow_hashref ) {
+                $ref->{funcname} = $funcname;
                 my $job = TheSchwartz::Moosified::Job->new( $ref );
                 push @jobs, $job;
             }
@@ -456,12 +472,17 @@ sub funcname_to_id {
     my $cache = $self->_funcmap_cache($dbh);
 
     unless ( exists $cache->{funcname2id}{$funcname} ) {
-        ## This might fail in a race condition since funcname is UNIQUE
-        my $sth = $dbh->prepare_cached(
-            'INSERT INTO funcmap (funcname) VALUES (?)');
-        eval { $sth->execute($funcname) };
+        my $id;
+        eval {
+            run_in_txn {
+                ## This might fail in a race condition since funcname is UNIQUE
+                my $sth = $dbh->prepare_cached(
+                    'INSERT INTO funcmap (funcname) VALUES (?)');
+                $sth->execute($funcname);
 
-        my $id = insert_id( $dbh, $sth, "funcmap", "funcid" );
+                $id = insert_id( $dbh, $sth, "funcmap", "funcid" );
+            } $dbh;
+        };
 
         ## If we got an exception, try to load the record again
         if ($@) {
@@ -738,6 +759,8 @@ L<TheSchwartz>, L<TheSchwartz::Simple>
 =head1 AUTHOR
 
 Fayland Lam, C<< <fayland at gmail.com> >>
+
+Jeremy Stashewsky, C<< <jstash+cpan at gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 

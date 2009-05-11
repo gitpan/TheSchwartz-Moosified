@@ -4,7 +4,7 @@ use base 'Exporter';
 use Carp;
 use vars qw/@EXPORT_OK/;
 
-@EXPORT_OK = qw/insert_id sql_for_unixtime bind_param_attr/;
+@EXPORT_OK = qw/insert_id sql_for_unixtime bind_param_attr run_in_txn select_for_update order_by_priority/;
 
 sub insert_id {
     my ( $dbh, $sth, $table, $col ) = @_;
@@ -36,6 +36,9 @@ sub sql_for_unixtime {
     if ( $driver and $driver eq 'mysql' ) {
         return "UNIX_TIMESTAMP()";
     }
+    if ( $driver and $driver eq 'Pg' ) {
+        return "EXTRACT(EPOCH FROM NOW())::integer";
+    }
     
     return time();
 }
@@ -55,6 +58,56 @@ sub bind_param_attr {
     return;
 }
 
+sub select_for_update {
+    my $dbh = shift;
+    my $driver = $dbh->{Driver}{Name};
+    if ( !$driver or $driver eq 'SQLite' ) {
+        return '';
+    }
+    else {
+        # at least Pg, mysql, and oracle support FOR UPDATE:
+        return ' FOR UPDATE';
+    }
+}
+
+sub order_by_priority {
+    my $dbh = shift;
+
+    my $driver = $dbh->{Driver}{Name};
+    if ( $driver and $driver eq 'Pg' ) {
+        # make NULL sort as if it were 0, consistent with SQLite
+        # Suggestion:
+        # CREATE INDEX ix_job_piro_non_null ON job (COALESCE(priority,0));
+        return 'ORDER BY COALESCE(priority,0) DESC';
+    }
+    return 'ORDER BY priority DESC';
+}
+
+sub run_in_txn (&$) {
+    my $code = shift;
+    my $dbh = shift;
+    local $dbh->{RaiseError} = 1;
+
+    my $need_txn = $dbh->{AutoCommit} ? 1 : 0;
+    return $code->() unless $need_txn;
+
+    my @rv;
+    my $rv;
+    eval {
+        $dbh->begin_work;
+        if (wantarray) {
+            @rv = $code->();
+        }
+        else {
+            $rv = $code->();
+        }
+        $dbh->commit;
+    };
+    if (my $err = $@) { eval { $dbh->rollback }; die $err }
+
+    return @rv if wantarray;
+    return $rv;
+}
 
 1;
 __END__
