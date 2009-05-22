@@ -1,6 +1,6 @@
 ---
 name: TheSchwartz-Moosified
-version: 0.04
+version: 0.05_001
 author:
   - 'Fayland Lam <fayland@gmail.com>'
 abstract: TheSchwartz based on Moose!
@@ -9,13 +9,13 @@ resources:
   license: ~
 build_requires:
   DBI: 0
-  Moose: 0.57
+  Moose: 0.79
   Scalar::Util: 0
   Test::More: 0
 provides:
   TheSchwartz::Moosified:
     file: lib/TheSchwartz/Moosified.pm
-    version: 0.04
+    version: 0.05_001
   TheSchwartz::Moosified::Job:
     file: lib/TheSchwartz/Moosified/Job.pm
   TheSchwartz::Moosified::JobHandle:

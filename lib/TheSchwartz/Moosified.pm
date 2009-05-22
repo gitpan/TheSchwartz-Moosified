@@ -11,7 +11,7 @@ use TheSchwartz::Moosified::Utils qw/insert_id sql_for_unixtime bind_param_attr 
 use TheSchwartz::Moosified::Job;
 use TheSchwartz::Moosified::JobHandle;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05_001';
 our $AUTHORITY = 'cpan:FAYLAND';
 
 ## Number of jobs to fetch at a time in find_job_for_workers.
@@ -57,25 +57,11 @@ has 'funcmap_cache' => ( is => 'rw', isa => 'HashRef', default => sub { {} } );
 has 'scoreboard'  => (
     is => 'rw',
     isa => 'Str',
-    trigger => sub {
-        my ($self, $dir) = @_;
-        
-        return unless $dir;
-        return if (-f $dir); # no endless loop
-
-        # They want the scoreboard but don't care where it goes
-        if (($dir eq '1') or ($dir eq 'on')) {
-            $dir = File::Spec->tmpdir();
-        }
-    
-        $dir .= '/theschwartz';
-        unless (-e $dir) {
-            mkdir($dir, 0755) or die "Can't create scoreboard directory '$dir': $!";
-        }
-        
-        $self->{scoreboard} = $dir."/scoreboard.$$";
-    }
+    trigger => \&_trigger_scoreboard,
 );
+
+has 'prefix' => ( is => 'rw', isa => 'Str', default => '' );
+has 'error_length' => ( is => 'rw', isa => 'Int', default => 255 );
 
 sub debug {
     my $self = shift;
@@ -103,8 +89,9 @@ sub _try_insert {
         }
         my @col = keys %$row;
 
-        my $sql = sprintf 'INSERT INTO job (%s) VALUES (%s)',
-            join( ", ", @col ), join( ", ", ("?") x @col );
+        my $table_job = $self->prefix . 'job';
+        my $sql = sprintf 'INSERT INTO %s (%s) VALUES (%s)',
+            $table_job, join( ", ", @col ), join( ", ", ("?") x @col );
 
         my $sth = $dbh->prepare_cached($sql);
         my $i = 1;
@@ -117,7 +104,7 @@ sub _try_insert {
         }
         $sth->execute();
 
-        my $jobid = insert_id( $dbh, $sth, "job", "jobid" );
+        my $jobid = insert_id( $dbh, $sth, $table_job, "jobid" );
         $job->jobid($jobid);
     } $dbh;
 }
@@ -138,6 +125,7 @@ sub insert {
         eval {
             $self->_try_insert($job,$dbh);
         };
+        $self->debug("insert failed: $@") if $@;
 
         next unless $job->jobid;
 
@@ -181,7 +169,8 @@ sub find_job_for_workers {
                       @$worker_classes;
 
             my $ids = join(',', @ids);
-            my $sql = qq~SELECT * FROM job WHERE funcid IN ($ids) AND run_after <= $unixtime AND grabbed_until <= $unixtime $order_by LIMIT $limit~;
+            my $table_job = $client->prefix . 'job';
+            my $sql = qq~SELECT * FROM $table_job WHERE funcid IN ($ids) AND run_after <= $unixtime AND grabbed_until <= $unixtime $order_by LIMIT $limit~;
 
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute();
@@ -226,15 +215,19 @@ sub _grab_a_job {
         
         my $new_grabbed_until = $server_time + ($worker_class->grab_for || 1);
 
-        my $sql  = q~UPDATE job SET grabbed_until = ? WHERE jobid = ? AND grabbed_until = ?~;
+        # Prevent a condition that could result in more than one client
+        # grabbing the same job b/c it doesn't look grabbed
+        next JOB if ($new_grabbed_until == $old_grabbed_until);
+
+        ## Update the job in the database, and end the transaction.
+
+        my $table_job = $client->prefix . 'job';
+        my $sql  = qq~UPDATE $table_job SET grabbed_until = ? WHERE jobid = ? AND grabbed_until = ?~;
         my $sth  = $dbh->prepare($sql);
         $sth->execute($new_grabbed_until, $job->jobid, $old_grabbed_until);
         my $rows = $sth->rows;
 
-        ## Update the job in the database, and end the transaction.
-        if ($rows < 1) {
-            next JOB;
-        }
+        next JOB unless $rows == 1;
         
         $job->grabbed_until( $new_grabbed_until );
 
@@ -281,7 +274,6 @@ sub list_jobs {
 
     my @jobs;
     for my $dbh ( $self->shuffled_databases ) {
-        #my $order_by = $self->prioritize ? 'ORDER BY priority DESC' : '';
         my $order_by = $self->prioritize ? order_by_priority($dbh) : '';
 
         eval {
@@ -295,7 +287,8 @@ sub list_jobs {
                 $funcop = '=';
             }
 
-            my $sql = qq~SELECT * FROM job WHERE funcid $funcop $funcid $order_by LIMIT $limit~;
+            my $table_job = $self->prefix . 'job';
+            my $sql = qq~SELECT * FROM $table_job WHERE funcid $funcop $funcid $order_by LIMIT $limit~;
             my @value = ();
             for (@options) {
                 $sql .= " AND $_->{key} $_->{op} ?";
@@ -354,7 +347,8 @@ sub _find_job_with_coalescing {
             ##    in the past).
             my $funcid = $client->funcname_to_id($dbh, $funcname);
 
-            my $sql = qq~SELECT * FROM job WHERE funcid = ? AND run_after <= $unixtime AND grabbed_until <= $unixtime AND coalesce $op ? $order_by LIMIT $limit~;
+            my $table_job = $client->prefix . 'job';
+            my $sql = qq~SELECT * FROM $table_job WHERE funcid = ? AND run_after <= $unixtime AND grabbed_until <= $unixtime AND coalesce $op ? $order_by LIMIT $limit~;
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute( $funcid, $coval );
             while ( my $ref = $sth->fetchrow_hashref ) {
@@ -470,6 +464,7 @@ sub funcname_to_id {
 
     my $dbid  = refaddr $dbh;
     my $cache = $self->_funcmap_cache($dbh);
+    my $table_funcmap = $self->prefix . 'funcmap';
 
     unless ( exists $cache->{funcname2id}{$funcname} ) {
         my $id;
@@ -477,17 +472,17 @@ sub funcname_to_id {
             run_in_txn {
                 ## This might fail in a race condition since funcname is UNIQUE
                 my $sth = $dbh->prepare_cached(
-                    'INSERT INTO funcmap (funcname) VALUES (?)');
+                    "INSERT INTO $table_funcmap (funcname) VALUES (?)");
                 $sth->execute($funcname);
 
-                $id = insert_id( $dbh, $sth, "funcmap", "funcid" );
+                $id = insert_id( $dbh, $sth, $table_funcmap, "funcid" );
             } $dbh;
         };
 
         ## If we got an exception, try to load the record again
         if ($@) {
             my $sth = $dbh->prepare_cached(
-                'SELECT funcid FROM funcmap WHERE funcname = ?');
+                "SELECT funcid FROM $table_funcmap WHERE funcname = ?");
             $sth->execute($funcname);
             $id = $sth->fetchrow_arrayref->[0]
                 or croak "Can't find or create funcname $funcname: $@";
@@ -504,9 +499,10 @@ sub funcname_to_id {
 sub _funcmap_cache {
     my ( $client, $dbh ) = @_;
     my $dbid = refaddr $dbh;
+    my $table_funcmap = $client->prefix . 'funcmap';
     unless ( exists $client->funcmap_cache->{$dbid} ) {
         my $cache = { funcname2id => {}, funcid2name => {} };
-        my $sth = $dbh->prepare_cached('SELECT funcid, funcname FROM funcmap');
+        my $sth = $dbh->prepare_cached("SELECT funcid, funcname FROM $table_funcmap");
         $sth->execute;
         while ( my $row = $sth->fetchrow_arrayref ) {
             $cache->{funcname2id}{ $row->[1] } = $row->[0];
@@ -515,6 +511,20 @@ sub _funcmap_cache {
         $client->funcmap_cache->{$dbid} = $cache;
     }
     return $client->funcmap_cache->{$dbid};
+}
+
+sub _trigger_scoreboard {
+    my ($self, $dir) = @_;
+    
+    return unless $dir;
+    return if (-f $dir); # no endless loop
+
+    # They want the scoreboard but don't care where it goes
+    if (($dir eq '1') or ($dir eq 'on')) {
+        $dir = File::Spec->tmpdir();
+    }
+
+    $self->{scoreboard} = $dir."/theschwartz.scoreboard.$$";
 }
 
 sub start_scoreboard {
@@ -657,7 +667,7 @@ read more on L<TheSchwartz>
 
 =item * C<databases>
 
-An arrayref of dbh.
+Databases containing TheSchwartz jobs, shuffled before each use.
 
     my $dbh1 = DBI->conncet(@dbi_info);
     my $dbh2 = $schema->storage->dbh;
@@ -669,7 +679,7 @@ An arrayref of dbh.
 
 =item * C<verbose>
 
-control the debug.
+controls debug logging.
 
     my $client = TheSchwartz::Moosified->new( verbose => 1 );
     
@@ -681,6 +691,12 @@ control the debug.
         print STDERR "[INFO] $msg\n";
     } );
 
+=item * C<prefix>
+
+optional prefix for tables. compatible with L<TheSchwartz::Simple>
+
+    my $client = TheSchwartz::Moosified->new( prefix => 'theschwartz_' );
+
 =item * C<scoreboard>
 
 save job info to file. by default, the file will be saved at $tmpdir/theschwartz/scoreboard.$$
@@ -691,6 +707,12 @@ save job info to file. by default, the file will be saved at $tmpdir/theschwartz
     my $client = TheSchwartz::Moosified->new();
     # be sure the file is there
     $client->scoreboard( "/home/fayland/theschwartz/scoreboard.log" );
+
+=item * C<error_length>
+
+optional, defaults to 255.  Messages logged to the C<failure_log> (the
+C<error> table) are truncated to this length.  Setting this to zero means no
+truncation (although the database you are using may truncate this for you).
 
 =back
 

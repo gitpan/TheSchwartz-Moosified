@@ -2,7 +2,7 @@ package TheSchwartz::Moosified::Job;
 
 use Moose;
 use Storable ();
-use TheSchwartz::Moosified::Utils qw/sql_for_unixtime run_in_txn select_for_update/;
+use TheSchwartz::Moosified::Utils qw/sql_for_unixtime run_in_txn/;
 use TheSchwartz::Moosified::JobHandle;
 
 has 'jobid'         => ( is => 'rw', isa => 'Int' );
@@ -75,17 +75,22 @@ sub as_hashref {
 
 sub add_failure {
     my $job = shift;
-    my ($msg) = @_;
+    my $msg = shift;
+    $msg = '' unless defined $msg;
     
-    my $sql = q~INSERT INTO error (error_time, jobid, message, funcid) VALUES (?, ?, ?, ?)~;
+    my $table_error = $job->handle->client->prefix . 'error';
+    if (my $len = $job->handle->client->error_length) {
+        $msg = substr($msg,0,$len);
+    }
+    my $sql = qq~INSERT INTO $table_error (error_time, jobid, message, funcid) VALUES (?, ?, ?, ?)~;
     my $dbh = $job->dbh;
     my $sth = $dbh->prepare($sql);
-    $sth->execute(time(), $job->jobid, $msg || '', $job->funcid);
+    $sth->execute(time(), $job->jobid, $msg, $job->funcid);
 
     # and let's lazily clean some errors while we're here.
     my $maxage = $TheSchwartz::Moosified::T_ERRORS_MAX_AGE || (86400*7);
     my $dtime  = time() - $maxage;
-    $dbh->do(qq~DELETE FROM error WHERE error_time < $dtime~);
+    $dbh->do(qq~DELETE FROM $table_error WHERE error_time < $dtime~);
 
     return 1;
 }
@@ -109,7 +114,8 @@ sub remove {
     my $job = shift;
     
     my $jobid = $job->jobid;
-    $job->dbh->do(qq~DELETE FROM job WHERE jobid = $jobid~);
+    my $table_job = $job->handle->client->prefix . 'job';
+    $job->dbh->do(qq~DELETE FROM $table_job WHERE jobid = $jobid~);
 }
 
 sub set_exit_status {
@@ -118,23 +124,34 @@ sub set_exit_status {
     my $class = $job->funcname;
     my $secs = $class->keep_exit_status_for or return;
 
+    my $t = time();
     my $jobid = $job->jobid;
+    my $funcid = $job->funcid;
+    my @status = ($exit, $t, $t + $secs);
     my $dbh = $job->dbh;
+    my $table_exitstatus = $job->handle->client->prefix . 'exitstatus';
     my $needs_update = 0;
     {
-        my $sth = $job->dbh->prepare(
-            q~SELECT 1 FROM exitstatus WHERE jobid=?~ . select_for_update($dbh)
-        );
-        $sth->execute($jobid);
-        ($needs_update) = $sth->fetchrow_array;
+        my $sth = $dbh->prepare(qq{
+            INSERT INTO $table_exitstatus
+            (funcid, status, completion_time, delete_after, jobid)
+            SELECT ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM $table_exitstatus WHERE jobid = ?
+            )
+        });
+        $sth->execute($funcid, @status, $jobid, $jobid);
+        $needs_update = ($sth->rows == 0);
     }
-
-    # note params are the same order for both queries:
-    my $sql = ($needs_update) ?
-        q~UPDATE exitstatus SET funcid=?, status=?, completion_time=?, delete_after=? WHERE jobid=?~ :
-        q~INSERT INTO exitstatus (funcid, status, completion_time, delete_after, jobid) VALUES (?, ?, ?, ?, ?)~ ;
-    my $t = time();
-    $dbh->do($sql, {}, $job->funcid, $exit, $t, $t + $secs, $jobid);
+    if ($needs_update) {
+        # only update if this status is newest
+        my $sth = $dbh->prepare(qq{
+            UPDATE $table_exitstatus
+            SET status=?, completion_time=?, delete_after=?
+            WHERE jobid = ? AND completion_time < ?
+        });
+        $sth->execute(@status, $jobid, $t);
+    }
 
     # and let's lazily clean some exitstatus while we're here.  but
     # rather than doing this query all the time, we do it 1/nth of the
@@ -143,7 +160,7 @@ sub set_exit_status {
     my $clean_thres = $TheSchwartz::Moosified::T_EXITSTATUS_CLEAN_THRES || 0.10;
     if (rand() < $clean_thres) {
         my $unixtime = sql_for_unixtime();
-        $dbh->do(qq~DELETE FROM exitstatus WHERE delete_after < $unixtime~);
+        $dbh->do(qq~DELETE FROM $table_exitstatus WHERE delete_after < $unixtime~);
     }
 
     return 1;
@@ -186,9 +203,10 @@ sub _failed {
         $job->add_failure($msg);
 
         if ($_retry) {
+            my $table_job = $job->handle->client->prefix . 'job';
             my $class = $job->funcname;
             my @bind;
-            my $sql = q{UPDATE job SET };
+            my $sql = qq{UPDATE $table_job SET };
             if (my $delay = $class->retry_delay($failures)) {
                 my $run_after = time() + $delay;
                 $job->run_after($run_after);
