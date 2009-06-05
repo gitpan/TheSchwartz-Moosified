@@ -11,7 +11,7 @@ use TheSchwartz::Moosified::Utils qw/insert_id sql_for_unixtime bind_param_attr 
 use TheSchwartz::Moosified::Job;
 use TheSchwartz::Moosified::JobHandle;
 
-our $VERSION = '0.05_001';
+our $VERSION = '0.05_002';
 our $AUTHORITY = 'cpan:FAYLAND';
 
 ## Number of jobs to fetch at a time in find_job_for_workers.
@@ -79,8 +79,10 @@ sub _try_insert {
     my $self = shift;
     my $job = shift;
     my $dbh = shift;
+
+    $job->funcid( $self->funcname_to_id( $dbh, $job->funcname ) );
+
     run_in_txn {
-        $job->funcid( $self->funcname_to_id( $dbh, $job->funcname ) );
         $job->insert_time(time());
 
         my $row = $job->as_hashref;
@@ -178,6 +180,7 @@ sub find_job_for_workers {
                 my $job = TheSchwartz::Moosified::Job->new( $ref );
                 push @jobs, $job;
             }
+            $sth->finish;
         };
 #        if ($@) {
 #
@@ -270,7 +273,7 @@ sub list_jobs {
         };
     }
     
-    my $limit    = $arg->{limit} || $FIND_JOB_BATCH_SIZE;
+    my $limit = $arg->{limit} || $FIND_JOB_BATCH_SIZE;
 
     my @jobs;
     for my $dbh ( $self->shuffled_databases ) {
@@ -288,12 +291,13 @@ sub list_jobs {
             }
 
             my $table_job = $self->prefix . 'job';
-            my $sql = qq~SELECT * FROM $table_job WHERE funcid $funcop $funcid $order_by LIMIT $limit~;
+            my $sql = qq~SELECT * FROM $table_job WHERE funcid $funcop $funcid~;
             my @value = ();
             for (@options) {
                 $sql .= " AND $_->{key} $_->{op} ?";
                 push @value, $_->{value};
             }
+            $sql .= qq~ $order_by LIMIT $limit~;
 
             my $sth = $dbh->prepare_cached($sql);
             $sth->execute(@value);
@@ -310,6 +314,7 @@ sub list_jobs {
                 }
                 push @jobs, $job;
             }
+            $sth->finish;
         };
     }
 
@@ -356,6 +361,7 @@ sub _find_job_with_coalescing {
                 my $job = TheSchwartz::Moosified::Job->new( $ref );
                 push @jobs, $job;
             }
+            $sth->finish;
         };
 #        if ($@) {
 #
@@ -484,8 +490,9 @@ sub funcname_to_id {
             my $sth = $dbh->prepare_cached(
                 "SELECT funcid FROM $table_funcmap WHERE funcname = ?");
             $sth->execute($funcname);
-            $id = $sth->fetchrow_arrayref->[0]
-                or croak "Can't find or create funcname $funcname: $@";
+            ($id) = $sth->fetchrow_array;
+            $sth->finish;
+            croak "Can't find or create funcname $funcname: $@" unless $id;
         }
 
         $cache->{funcname2id}{ $funcname } = $id;
@@ -508,6 +515,7 @@ sub _funcmap_cache {
             $cache->{funcname2id}{ $row->[1] } = $row->[0];
             $cache->{funcid2name}{ $row->[0] } = $row->[1];
         }
+        $sth->finish;
         $client->funcmap_cache->{$dbid} = $cache;
     }
     return $client->funcmap_cache->{$dbid};
