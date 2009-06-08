@@ -11,7 +11,7 @@ use TheSchwartz::Moosified::Utils qw/insert_id sql_for_unixtime bind_param_attr 
 use TheSchwartz::Moosified::Job;
 use TheSchwartz::Moosified::JobHandle;
 
-our $VERSION = '0.05_002';
+our $VERSION = '0.05_003';
 our $AUTHORITY = 'cpan:FAYLAND';
 
 ## Number of jobs to fetch at a time in find_job_for_workers.
@@ -154,11 +154,11 @@ sub find_job_for_workers {
     return unless (scalar @$worker_classes);
 
     my $limit    = $FIND_JOB_BATCH_SIZE;
-    my $order_by = $client->prioritize ? 'ORDER BY priority DESC' : '';
 
     for my $dbh ( $client->shuffled_databases ) {
 
         my $unixtime = sql_for_unixtime($dbh);
+        my $order_by = $client->prioritize ? order_by_priority($dbh) : '';
 
         my @jobs;
         eval {
